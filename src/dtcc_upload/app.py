@@ -387,6 +387,9 @@ def create_app() -> FastAPI:
             yield chunk
 
     def multipart_counts(request: Request, *, default_total_parts: int) -> tuple[int, int]:
+        # FastAPI has already parsed multipart by the time this sync route runs.
+        # Starlette stores that parsed form on _form; the regression test locks
+        # down non-file field enforcement if this private cache ever changes.
         form = getattr(request, "_form", None)
         if form is None:
             return default_total_parts, 1
@@ -658,14 +661,17 @@ def create_app() -> FastAPI:
         finally:
             if not committed:
                 if upload_started and not suppress_abort_event:
-                    record_event(
-                        request,
-                        principal,
-                        "upload_aborted",
-                        dataset_key=dataset_key,
-                        version_id=version_id,
-                        request_id=request_id,
-                    )
+                    try:
+                        record_event(
+                            request,
+                            principal,
+                            "upload_aborted",
+                            dataset_key=dataset_key,
+                            version_id=version_id,
+                            request_id=request_id,
+                        )
+                    except Exception:
+                        pass
                 if finalized:
                     storage.cleanup_version_dir(dataset_key, version_id)
                 if pending_inserted:
