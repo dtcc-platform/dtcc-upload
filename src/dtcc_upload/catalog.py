@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dtcc_upload.observability import log_event
+
 
 class DatasetKeyConflict(RuntimeError):
     pass
@@ -183,6 +185,104 @@ class Catalog:
                 dict(row)
                 for row in conn.execute("SELECT * FROM principals ORDER BY principal_id")
             ]
+
+    def record_event(
+        self,
+        *,
+        action: str,
+        actor_principal_id: str | None = None,
+        dataset_key: str | None = None,
+        version_id: str | None = None,
+        request_id: str | None = None,
+        reason: str | None = None,
+        ip: str | None = None,
+        user_agent: str | None = None,
+        token_id: str | None = None,
+    ) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO events(
+                  actor_principal_id, action, dataset_key, version_id,
+                  request_id, reason, ip, user_agent, token_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    actor_principal_id,
+                    action,
+                    dataset_key,
+                    version_id,
+                    request_id,
+                    reason,
+                    ip,
+                    user_agent,
+                    token_id,
+                ),
+            )
+        log_event(
+            action,
+            actor_principal_id=actor_principal_id,
+            dataset_key=dataset_key,
+            version_id=version_id,
+            request_id=request_id,
+            reason=reason,
+            ip=ip,
+            user_agent=user_agent,
+            token_id=token_id,
+        )
+
+    def get_metrics(self) -> dict[str, object]:
+        with self.connection() as conn:
+            version_counts = {
+                str(row["status"]): int(row["count"])
+                for row in conn.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM versions
+                    GROUP BY status
+                    """
+                )
+            }
+            file_row = conn.execute(
+                """
+                SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
+                FROM files
+                """
+            ).fetchone()
+            usage_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(stored_bytes), 0) AS stored_bytes,
+                       COALESCE(SUM(version_count), 0) AS version_count
+                FROM principal_usage
+                """
+            ).fetchone()
+            event_counts = {
+                str(row["action"]): int(row["count"])
+                for row in conn.execute(
+                    """
+                    SELECT action, COUNT(*) AS count
+                    FROM events
+                    GROUP BY action
+                    """
+                )
+            }
+        return {
+            "versions": {
+                "pending": version_counts.get("pending", 0),
+                "committed": version_counts.get("committed", 0),
+                "retracted": version_counts.get("retracted", 0),
+            },
+            "files": {
+                "count": int(file_row["count"]),
+                "bytes": int(file_row["bytes"]),
+            },
+            "principal_usage": {
+                "stored_bytes": int(usage_row["stored_bytes"]),
+                "version_count": int(usage_row["version_count"]),
+            },
+            "events": event_counts,
+        }
 
     def claim_dataset(self, dataset_key: str, owner_principal_id: str) -> dict[str, Any]:
         with self.connection() as conn:

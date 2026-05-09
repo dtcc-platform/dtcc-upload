@@ -38,6 +38,21 @@ def _extract_bearer(authorization: str | None) -> str:
     return token
 
 
+def _record_auth_failure(request: Request, reason: str) -> None:
+    catalog = getattr(request.app.state, "catalog", None)
+    if catalog is None:
+        return
+    try:
+        catalog.record_event(
+            action="auth_failure",
+            reason=reason,
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except Exception:
+        return
+
+
 def resolve_principal(token: str, settings: Settings) -> Principal | None:
     matched: TokenConfig | None = None
     for candidate in settings.tokens:
@@ -60,12 +75,18 @@ def get_settings(request: Request) -> Settings:
 
 
 def require_principal(
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> Principal:
-    token = _extract_bearer(authorization)
+    try:
+        token = _extract_bearer(authorization)
+    except HTTPException as exc:
+        _record_auth_failure(request, str(exc.detail))
+        raise
     principal = resolve_principal(token, settings)
     if principal is None:
+        _record_auth_failure(request, "Invalid bearer token")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
     return principal
 

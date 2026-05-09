@@ -1,8 +1,33 @@
 from __future__ import annotations
 
+from threading import Lock
+
 from fastapi import HTTPException
 
 from dtcc_upload.config import Settings
+
+
+class UploadConcurrencyLimiter:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._active: dict[str, int] = {}
+
+    def acquire(self, principal_id: str, max_concurrent: int) -> bool:
+        limit = max(1, max_concurrent)
+        with self._lock:
+            current = self._active.get(principal_id, 0)
+            if current >= limit:
+                return False
+            self._active[principal_id] = current + 1
+            return True
+
+    def release(self, principal_id: str) -> None:
+        with self._lock:
+            current = self._active.get(principal_id, 0)
+            if current <= 1:
+                self._active.pop(principal_id, None)
+            else:
+                self._active[principal_id] = current - 1
 
 
 def enforce_upload_counts(

@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from dtcc_upload.auth import Principal, require_principal, require_upload
+from dtcc_upload.auth import Principal, require_principal, require_upload, resolve_principal
 from dtcc_upload.catalog import (
     Catalog,
     DatasetKeyConflict,
@@ -20,7 +20,9 @@ from dtcc_upload.catalog import (
 )
 from dtcc_upload.config import load_settings
 from dtcc_upload.hash_utils import file_set_sha256, sha256_bytes
-from dtcc_upload.limits import enforce_upload_bytes, enforce_upload_counts
+from dtcc_upload.limits import UploadConcurrencyLimiter, enforce_upload_bytes, enforce_upload_counts
+from dtcc_upload.mime import MediaTypeError, sniff_media_type, validate_media_type
+from dtcc_upload.observability import collect_metrics
 from dtcc_upload.responses import bytes_response, file_response
 from dtcc_upload.storage import Storage
 from dtcc_upload.validation import extract_manifest_file_paths, validate_dataset_key, validate_manifest
@@ -28,6 +30,27 @@ from dtcc_upload.validation import extract_manifest_file_paths, validate_dataset
 
 class RetractionRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1024)
+
+
+def read_upload_bytes_limited(
+    fileobj: BinaryIO,
+    *,
+    max_bytes: int,
+    overflow_detail: str,
+    chunk_size: int = 64 * 1024,
+) -> bytes:
+    fileobj.seek(0)
+    chunks: list[bytes] = []
+    seen = 0
+    while True:
+        chunk = fileobj.read(min(chunk_size, max_bytes + 1 - seen))
+        if not chunk:
+            break
+        seen += len(chunk)
+        if seen > max_bytes:
+            raise HTTPException(status_code=413, detail=overflow_detail)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def create_app() -> FastAPI:
@@ -52,9 +75,11 @@ def create_app() -> FastAPI:
     app = FastAPI(title="DTCC Upload", lifespan=lifespan)
     app.state.settings = settings
     app.state.catalog = catalog
+    app.state.upload_limiter = UploadConcurrencyLimiter()
 
     @app.middleware("http")
     async def reject_large_uploads(request: Request, call_next):
+        acquired_principal_id: str | None = None
         if request.method == "POST" and request.url.path == "/v1/datasets":
             if request.headers.get("transfer-encoding", "").lower() == "chunked":
                 return JSONResponse(status_code=411, content={"detail": "Content-Length required"})
@@ -68,7 +93,23 @@ def create_app() -> FastAPI:
             if request_bytes is not None and request_bytes > app.state.settings.max_total_upload_bytes:
                 return JSONResponse(status_code=413, content={"detail": "Upload too large"})
 
-        return await call_next(request)
+            authorization = request.headers.get("authorization")
+            scheme, separator, token = authorization.partition(" ") if authorization else ("", "", "")
+            if separator and scheme.lower() == "bearer":
+                principal = resolve_principal(token.strip(), app.state.settings)
+                if principal is not None and principal.has_scope("upload"):
+                    if not app.state.upload_limiter.acquire(
+                        principal.principal_id,
+                        app.state.settings.max_concurrent_uploads_per_principal,
+                    ):
+                        return JSONResponse(status_code=429, content={"detail": "Too many concurrent uploads"})
+                    acquired_principal_id = principal.principal_id
+
+        try:
+            return await call_next(request)
+        finally:
+            if acquired_principal_id is not None:
+                app.state.upload_limiter.release(acquired_principal_id)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -85,6 +126,12 @@ def create_app() -> FastAPI:
             "token_id": principal.token_id,
             "scopes": list(principal.scopes),
         }
+
+    @app.get("/v1/metrics")
+    def metrics(request: Request, principal: Principal = Depends(require_principal)) -> dict[str, object]:
+        if not principal.has_scope("browse"):
+            raise HTTPException(status_code=403, detail="Browse scope required")
+        return collect_metrics(request.app.state.catalog)
 
     @app.get("/v1/datasets")
     def list_datasets(
@@ -135,6 +182,28 @@ def create_app() -> FastAPI:
     def reject_committed_without_browse(version: dict[str, object] | None, principal: Principal) -> None:
         if version is not None and version["status"] == "committed" and not principal.has_scope("browse"):
             raise HTTPException(status_code=403, detail="Browse scope required")
+
+    def record_event(
+        request: Request,
+        principal: Principal,
+        action: str,
+        *,
+        dataset_key: str | None = None,
+        version_id: str | None = None,
+        request_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        request.app.state.catalog.record_event(
+            action=action,
+            actor_principal_id=principal.principal_id,
+            dataset_key=dataset_key,
+            version_id=version_id,
+            request_id=request_id,
+            reason=reason,
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            token_id=principal.token_id,
+        )
 
     @app.get("/v1/datasets/{dataset_key}")
     def get_dataset_detail(
@@ -291,6 +360,14 @@ def create_app() -> FastAPI:
             version = catalog.retract_version(dataset_key, version_id, principal.principal_id, body.reason if body else None)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Not found") from exc
+        record_event(
+            request,
+            principal,
+            "retracted",
+            dataset_key=dataset_key,
+            version_id=version_id,
+            reason=body.reason if body else None,
+        )
         return {"dataset_key": dataset_key, "version_id": version_id, "status": version["status"]}
 
     def iter_limited_file_chunks(
@@ -358,10 +435,11 @@ def create_app() -> FastAPI:
             non_file_fields=non_file_fields,
         )
 
-        manifest.file.seek(0)
-        manifest_bytes = manifest.file.read()
-        if len(manifest_bytes) > settings.max_manifest_bytes:
-            raise HTTPException(status_code=413, detail="Manifest too large")
+        manifest_bytes = read_upload_bytes_limited(
+            manifest.file,
+            max_bytes=settings.max_manifest_bytes,
+            overflow_detail="Manifest too large",
+        )
 
         try:
             raw_manifest = json.loads(manifest_bytes)
@@ -389,9 +467,20 @@ def create_app() -> FastAPI:
         pending_inserted = False
         finalized = False
         reserved_idempotency = False
+        upload_started = False
+        suppress_abort_event = False
         request_hash = ""
 
         try:
+            record_event(
+                request,
+                principal,
+                "upload_started",
+                dataset_key=dataset_key,
+                version_id=version_id,
+                request_id=request_id,
+            )
+            upload_started = True
             staged = storage.create_staging_dir(upload_id)
             storage.write_manifest(staged, manifest_bytes)
 
@@ -402,6 +491,13 @@ def create_app() -> FastAPI:
             )
             total_bytes = int(file_info["size"])
             enforce_upload_bytes(settings, total_bytes=total_bytes)
+            try:
+                sniffed_media_type = validate_media_type(
+                    parsed_manifest.media_type,
+                    sniff_media_type(bytes(file_info["sample"]), parsed_manifest.media_type),
+                )
+            except MediaTypeError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             file_records = [
                 {
                     "path": logical_path,
@@ -409,7 +505,7 @@ def create_app() -> FastAPI:
                     "size": total_bytes,
                     "sha256": str(file_info["sha256"]),
                     "media_type": parsed_manifest.media_type,
-                    "sniffed_media_type": parsed_manifest.media_type,
+                    "sniffed_media_type": sniffed_media_type,
                 }
             ]
 
@@ -442,6 +538,7 @@ def create_app() -> FastAPI:
                 reserved_idempotency = bool(reservation["_created"])
                 if not reserved_idempotency:
                     if reservation["status"] == "committed":
+                        suppress_abort_event = True
                         return json.loads(str(reservation["response_json"]))
                     raise HTTPException(status_code=409, detail="Idempotency-Key is already in progress")
 
@@ -463,6 +560,7 @@ def create_app() -> FastAPI:
                         json.dumps(response_payload),
                     )
                     reserved_idempotency = False
+                suppress_abort_event = True
                 return response_payload
 
             try:
@@ -505,6 +603,7 @@ def create_app() -> FastAPI:
                         json.dumps(response_payload),
                     )
                     reserved_idempotency = False
+                suppress_abort_event = True
                 return response_payload
 
             for record in file_records:
@@ -547,9 +646,26 @@ def create_app() -> FastAPI:
                     json.dumps(response_payload),
                 )
                 reserved_idempotency = False
+            record_event(
+                request,
+                principal,
+                "upload_committed",
+                dataset_key=dataset_key,
+                version_id=version_id,
+                request_id=request_id,
+            )
             return response_payload
         finally:
             if not committed:
+                if upload_started and not suppress_abort_event:
+                    record_event(
+                        request,
+                        principal,
+                        "upload_aborted",
+                        dataset_key=dataset_key,
+                        version_id=version_id,
+                        request_id=request_id,
+                    )
                 if finalized:
                     storage.cleanup_version_dir(dataset_key, version_id)
                 if pending_inserted:
