@@ -7,6 +7,26 @@ from fastapi.testclient import TestClient
 from dtcc_upload.catalog import Catalog
 
 
+def _upload(client, manifest_bytes_factory, *, title: str | None = None):
+    import json
+
+    raw_manifest = json.loads(manifest_bytes_factory())
+    if title is not None:
+        raw_manifest["title"] = title
+
+    response = client.post(
+        "/v1/datasets",
+        headers={"Authorization": "Bearer vasnas-token"},
+        data={"dataset_key": "smoke-slice"},
+        files={
+            "manifest": ("manifest.json", json.dumps(raw_manifest).encode("utf-8"), "application/json"),
+            "files": ("smoke_slice.geojson", b'{"type":"FeatureCollection"}', "application/geo+json"),
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
 def test_browse_requires_auth(client):
     response = client.get("/v1/datasets")
     assert response.status_code == 401
@@ -32,6 +52,31 @@ def test_browse_requires_browse_scope(monkeypatch, storage_root, db_path):
         response = test_client.get("/v1/datasets", headers={"Authorization": "Bearer upload-only-token"})
 
     assert response.status_code == 403
+
+
+def test_browse_rows_include_projection_and_size_metadata(client, manifest_bytes_factory):
+    upload = _upload(client, manifest_bytes_factory, title="Smoke Slice")
+
+    response = client.get("/v1/datasets", headers={"Authorization": "Bearer browser-token"})
+
+    assert response.status_code == 200
+    assert response.json()["items"][0] == {
+        "dataset_key": "smoke-slice",
+        "owner_principal_id": "vasnas",
+        "latest_committed_version_id": upload["version_id"],
+        "version_id": upload["version_id"],
+        "version_number": 1,
+        "status": "committed",
+        "format": "geojson",
+        "media_type": "application/geo+json",
+        "data_kind": "vector",
+        "product": "slice",
+        "title": "Smoke Slice",
+        "bounds_json": "[0.0, 0.0, 1.0, 1.0]",
+        "total_bytes": 28,
+        "file_count": 1,
+        "committed_at": response.json()["items"][0]["committed_at"],
+    }
 
 
 def test_include_retracted_cursor_keeps_same_dataset_rows(client, db_path):
