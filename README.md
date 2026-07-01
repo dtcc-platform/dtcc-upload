@@ -21,6 +21,19 @@ artifacts/smoke_slice.geojson
 
 The uploaded manifest is stored unchanged and remains the source of truth. Version catalog summary fields for v2 are derived from the primary artifact when possible.
 
+Consumers retrieve committed packages through the version endpoints:
+
+```text
+GET /v1/datasets/{dataset_key}/versions/{version_id}
+GET /v1/datasets/{dataset_key}/versions/{version_id}/manifest
+GET /v1/datasets/{dataset_key}/versions/{version_id}/files/{artifact_path}
+```
+
+The file route accepts nested v2 artifact paths such as
+`artifacts/smoke_slice.png`. Atlas and tangible-twin should read
+`manifest.artifacts[]` from the manifest response and select displayable
+artifacts by role, media type, and data kind rather than guessing file names.
+
 ## Local Development
 
 ```bash
