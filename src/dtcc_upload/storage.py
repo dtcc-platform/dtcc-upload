@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dtcc_upload.validation import validate_dataset_key, validate_logical_path
+from dtcc_upload.validation import validate_dataset_key, validate_logical_path, validate_package_path
 
 
 logger = logging.getLogger(__name__)
@@ -44,13 +44,16 @@ class Storage:
         logical_path: str,
         chunks: Iterable[bytes],
         *,
+        package_path: bool = False,
         sample_bytes: int = 4096,
     ) -> dict[str, object]:
-        safe_name = validate_logical_path(logical_path)
+        safe_name = validate_package_path(logical_path) if package_path else validate_logical_path(logical_path)
         path = staged / "files" / safe_name
         digest = hashlib.sha256()
         size = 0
         sample = bytearray()
+
+        self._mkdir_with_parent_fsync(path.parent, exist_ok=True)
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
@@ -97,7 +100,7 @@ class Storage:
         return final
 
     def resolve_version_file(self, version_dir: Path, logical_path: str) -> Path:
-        safe_name = validate_logical_path(logical_path)
+        safe_name = validate_package_path(logical_path)
         base = version_dir.resolve(strict=True)
         candidate = version_dir / "files" / safe_name
         if candidate.is_symlink():

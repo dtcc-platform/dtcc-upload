@@ -55,6 +55,24 @@ def test_write_staged_file_limits_sample_bytes(storage_root):
     assert file_info["size"] == 8
 
 
+def test_write_and_resolve_staged_package_file(storage_root):
+    storage = Storage(storage_root)
+    staged = storage.create_staging_dir("upload-1")
+    storage.write_manifest(staged, b"{}")
+
+    file_info = storage.write_staged_file(
+        staged,
+        "artifacts/smoke_slice.png",
+        [b"png-bytes"],
+        package_path=True,
+    )
+    final_dir = storage.finalize(staged, "smoke-slice", "v1")
+    resolved = storage.resolve_version_file(final_dir, "artifacts/smoke_slice.png")
+
+    assert file_info["path"] == "artifacts/smoke_slice.png"
+    assert resolved.read_bytes() == b"png-bytes"
+
+
 def test_resolve_version_file_rejects_escape(storage_root):
     storage = Storage(storage_root)
     final_dir = storage.version_dir("smoke-slice", "v1")

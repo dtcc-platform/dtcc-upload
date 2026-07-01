@@ -5,12 +5,14 @@ import unicodedata
 
 import pytest
 
+from dtcc_upload.models import ManifestV2Model
 from dtcc_upload.validation import (
     ManifestValidationError,
     extract_manifest_file_paths,
     validate_dataset_key,
     validate_logical_path,
     validate_manifest,
+    validate_package_path,
 )
 
 
@@ -57,6 +59,11 @@ def test_validate_logical_path_accepts_simple_filename():
 def test_validate_logical_path_rejects_unsafe_names(value: str):
     with pytest.raises(ValueError):
         validate_logical_path(value)
+
+
+def test_validate_logical_path_remains_strict_for_v1_nested_names():
+    with pytest.raises(ValueError):
+        validate_logical_path("artifacts/smoke_slice.png")
 
 
 def test_validate_logical_path_rejects_names_longer_than_255_utf8_bytes():
@@ -185,6 +192,18 @@ def test_validate_manifest_rejects_invalid_file_path():
         validate_manifest(manifest)
 
 
+def test_validate_manifest_v1_rejects_nested_file_path():
+    manifest = {
+        "name": "smoke",
+        "file": "artifacts/smoke_slice.geojson",
+        "format": "geojson",
+        "media_type": "application/geo+json",
+        "data_kind": "vector",
+    }
+    with pytest.raises(ManifestValidationError):
+        validate_manifest(manifest)
+
+
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
 def test_manifest_rejects_non_finite_bounds_after_coercion(value: str):
     manifest = {
@@ -224,3 +243,144 @@ def test_extract_manifest_file_paths_normalizes_single_file():
         }
     )
     assert extract_manifest_file_paths(manifest) == ["café.geojson"]
+
+
+def _v2_manifest(*artifacts):
+    return {
+        "schema_version": "dtcc-dataset-manifest-v2",
+        "identity": {"name": "smoke", "title": "Smoke"},
+        "metadata": {},
+        "provenance": {},
+        "presentation": {},
+        "request": {
+            "dataset_name": "smoke",
+            "parameters": {"product": "slice"},
+            "bounds": [0, 0, 10, 20],
+        },
+        "artifacts": list(artifacts),
+    }
+
+
+def _v2_artifact(path: str, *, role: str = "primary", format: str = "png", media_type: str = "image/png"):
+    return {
+        "path": path,
+        "role": role,
+        "format": format,
+        "media_type": media_type,
+        "data_kind": "Raster" if format == "png" else "Vector",
+    }
+
+
+def test_validate_package_path_accepts_nested_artifact_paths():
+    assert validate_package_path("artifacts/smoke_slice.png") == "artifacts/smoke_slice.png"
+    assert validate_package_path("artifacts/smoke_slice.geojson") == "artifacts/smoke_slice.geojson"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../x.png",
+        "artifacts/../x.png",
+        "/artifacts/x.png",
+        "artifacts/.hidden",
+        "artifacts\\x.png",
+        ".artifacts/x.png",
+        "artifacts//x.png",
+        "artifacts/./x.png",
+        "C:/artifacts/x.png",
+        "artifacts/has\x00nul.png",
+        "artifacts/has\x1fcontrol.png",
+    ],
+)
+def test_validate_package_path_rejects_unsafe_artifact_paths(value: str):
+    with pytest.raises(ValueError):
+        validate_package_path(value)
+
+
+def test_validate_manifest_accepts_v2_single_artifact():
+    parsed = validate_manifest(_v2_manifest(_v2_artifact("artifacts/smoke_slice.png")))
+
+    assert isinstance(parsed, ManifestV2Model)
+    assert parsed.schema_version == "dtcc-dataset-manifest-v2"
+    assert parsed.artifacts[0].path == "artifacts/smoke_slice.png"
+    assert parsed.artifacts[0].format == "png"
+    assert parsed.artifacts[0].media_type == "image/png"
+    assert parsed.artifacts[0].data_kind == "raster"
+    assert extract_manifest_file_paths(parsed) == ["artifacts/smoke_slice.png"]
+
+
+def test_validate_manifest_accepts_v2_multiple_artifacts():
+    parsed = validate_manifest(
+        _v2_manifest(
+            _v2_artifact("artifacts/smoke_slice.png"),
+            _v2_artifact(
+                "artifacts/smoke_slice.geojson",
+                role="auxiliary",
+                format="geojson",
+                media_type="application/geo+json",
+            ),
+        )
+    )
+
+    assert isinstance(parsed, ManifestV2Model)
+    assert extract_manifest_file_paths(parsed) == [
+        "artifacts/smoke_slice.png",
+        "artifacts/smoke_slice.geojson",
+    ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../x.png",
+        "artifacts/../x.png",
+        "/artifacts/x.png",
+        "artifacts/.hidden",
+        "artifacts\\x.png",
+    ],
+)
+def test_validate_manifest_rejects_v2_unsafe_artifact_paths(path: str):
+    with pytest.raises(ManifestValidationError):
+        validate_manifest(_v2_manifest(_v2_artifact(path)))
+
+
+def test_validate_manifest_rejects_v2_invalid_sha256():
+    artifact = _v2_artifact("artifacts/smoke_slice.png")
+    artifact["sha256"] = "A" * 64
+
+    with pytest.raises(ManifestValidationError):
+        validate_manifest(_v2_manifest(artifact))
+
+
+def test_validate_manifest_rejects_v2_shape_without_schema_version_even_if_v1_fields_exist():
+    manifest = _v2_manifest(_v2_artifact("artifacts/smoke_slice.png"))
+    del manifest["schema_version"]
+    manifest.update(
+        {
+            "name": "smoke",
+            "file": "smoke_slice.geojson",
+            "format": "geojson",
+            "media_type": "application/geo+json",
+            "data_kind": "vector",
+        }
+    )
+
+    with pytest.raises(ManifestValidationError, match="must declare schema_version"):
+        validate_manifest(manifest)
+
+
+def test_validate_manifest_rejects_wrong_schema_version_even_if_v1_fields_exist():
+    manifest = _v2_manifest(_v2_artifact("artifacts/smoke_slice.png"))
+    manifest["schema_version"] = "dtcc-dataset-manifest-v3"
+    manifest.update(
+        {
+            "name": "smoke",
+            "file": "smoke_slice.geojson",
+            "format": "geojson",
+            "media_type": "application/geo+json",
+            "data_kind": "vector",
+        }
+    )
+
+    with pytest.raises(ManifestValidationError, match="Unsupported manifest schema_version"):
+        validate_manifest(manifest)

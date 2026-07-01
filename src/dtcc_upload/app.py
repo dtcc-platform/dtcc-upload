@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import PurePosixPath
 from typing import BinaryIO
 
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -22,6 +23,7 @@ from dtcc_upload.config import load_settings
 from dtcc_upload.hash_utils import file_set_sha256, sha256_bytes
 from dtcc_upload.limits import UploadConcurrencyLimiter, enforce_upload_bytes, enforce_upload_counts
 from dtcc_upload.mime import MediaTypeError, sniff_media_type, validate_media_type
+from dtcc_upload.models import ManifestModel, ManifestV2Artifact, ManifestV2Model
 from dtcc_upload.observability import collect_metrics
 from dtcc_upload.responses import bytes_response, file_response
 from dtcc_upload.storage import Storage
@@ -30,6 +32,87 @@ from dtcc_upload.validation import extract_manifest_file_paths, validate_dataset
 
 class RetractionRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1024)
+
+
+def artifact_basename(path: str) -> str:
+    return PurePosixPath(path).name
+
+
+def match_v2_uploads(artifacts: list[ManifestV2Artifact], files: list[UploadFile]) -> dict[str, UploadFile]:
+    expected_paths = [artifact.path for artifact in artifacts]
+    if not expected_paths:
+        raise HTTPException(status_code=400, detail="Manifest must contain at least one artifact")
+
+    filenames = [upload.filename or "" for upload in files]
+    if any(not filename for filename in filenames):
+        raise HTTPException(status_code=400, detail="Uploaded files must include filenames")
+    duplicate_filenames = sorted({filename for filename in filenames if filenames.count(filename) > 1})
+    if duplicate_filenames:
+        raise HTTPException(status_code=400, detail=f"Duplicate uploaded filename: {duplicate_filenames[0]}")
+    if len(files) < len(expected_paths):
+        raise HTTPException(status_code=400, detail="Missing uploaded files for manifest artifacts")
+    if len(files) > len(expected_paths):
+        raise HTTPException(status_code=400, detail="Unexpected uploaded files for manifest artifacts")
+
+    expected_set = set(expected_paths)
+    basename_to_paths: dict[str, list[str]] = {}
+    for path in expected_paths:
+        basename_to_paths.setdefault(artifact_basename(path), []).append(path)
+
+    matched: dict[str, UploadFile] = {}
+    for upload in files:
+        filename = upload.filename or ""
+        # V2 package clients may send either the logical package path from
+        # manifest.artifacts[].path or only its basename. Basenames are accepted
+        # only when they identify exactly one artifact, keeping multipart order
+        # irrelevant and duplicate basenames deterministic.
+        artifact_path: str | None = None
+        if filename in expected_set:
+            artifact_path = filename
+        elif filename in basename_to_paths:
+            candidates = basename_to_paths[filename]
+            if len(candidates) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Ambiguous uploaded filename for artifact basename: {filename}",
+                )
+            artifact_path = candidates[0]
+        else:
+            raise HTTPException(status_code=400, detail=f"Unexpected uploaded file: {filename}")
+
+        if artifact_path in matched:
+            raise HTTPException(status_code=400, detail=f"Duplicate uploaded file for artifact: {artifact_path}")
+        matched[artifact_path] = upload
+
+    missing_paths = [path for path in expected_paths if path not in matched]
+    if missing_paths:
+        raise HTTPException(status_code=400, detail=f"Missing uploaded file for artifact: {missing_paths[0]}")
+    return matched
+
+
+def v2_version_summary(manifest: ManifestV2Model) -> dict[str, object]:
+    primary = next((artifact for artifact in manifest.artifacts if artifact.role == "primary"), manifest.artifacts[0])
+    product_value = manifest.request.parameters.get("product") if manifest.request.parameters else None
+    bounds = primary.bounds if primary.bounds is not None else manifest.request.bounds
+    return {
+        "format": primary.format,
+        "media_type": primary.media_type,
+        "data_kind": primary.data_kind,
+        "product": str(product_value) if product_value is not None else None,
+        "title": manifest.identity.title or manifest.identity.name,
+        "bounds_json": json.dumps(bounds) if bounds is not None else None,
+    }
+
+
+def v1_version_summary(manifest: ManifestModel) -> dict[str, object]:
+    return {
+        "format": manifest.format,
+        "media_type": manifest.media_type,
+        "data_kind": manifest.data_kind,
+        "product": manifest.product,
+        "title": manifest.title,
+        "bounds_json": json.dumps(manifest.bounds) if manifest.bounds is not None else None,
+    }
 
 
 def read_upload_bytes_limited(
@@ -451,8 +534,13 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=f"Invalid manifest: {exc}") from exc
 
         expected_paths = extract_manifest_file_paths(parsed_manifest)
-        if len(expected_paths) != 1 or len(files) != 1:
-            raise HTTPException(status_code=400, detail="Uploaded files do not match manifest")
+        is_v2_manifest = isinstance(parsed_manifest, ManifestV2Model)
+        if is_v2_manifest:
+            uploads_by_path = match_v2_uploads(parsed_manifest.artifacts, files)
+        else:
+            if len(expected_paths) != 1 or len(files) != 1:
+                raise HTTPException(status_code=400, detail="Uploaded files do not match manifest")
+            uploads_by_path = {expected_paths[0]: files[0]}
 
         catalog = getattr(request.app.state, "catalog", None) or Catalog(settings.db_path)
         try:
@@ -460,8 +548,6 @@ def create_app() -> FastAPI:
         except DatasetKeyConflict as exc:
             raise HTTPException(status_code=409, detail="dataset_key is owned by another principal") from exc
 
-        logical_path = expected_paths[0]
-        upload = files[0]
         version_id = uuid.uuid4().hex
         upload_id = uuid.uuid4().hex
         request_id = uuid.uuid4().hex
@@ -487,30 +573,78 @@ def create_app() -> FastAPI:
             staged = storage.create_staging_dir(upload_id)
             storage.write_manifest(staged, manifest_bytes)
 
-            file_info = storage.write_staged_file(
-                staged,
-                logical_path,
-                iter_limited_file_chunks(upload.file, settings=settings),
-            )
-            total_bytes = int(file_info["size"])
-            enforce_upload_bytes(settings, total_bytes=total_bytes)
-            try:
-                sniffed_media_type = validate_media_type(
-                    parsed_manifest.media_type,
-                    sniff_media_type(bytes(file_info["sample"]), parsed_manifest.media_type),
+            file_records: list[dict[str, object]] = []
+            total_bytes = 0
+            if is_v2_manifest:
+                for artifact in parsed_manifest.artifacts:
+                    upload = uploads_by_path[artifact.path]
+                    file_info = storage.write_staged_file(
+                        staged,
+                        artifact.path,
+                        iter_limited_file_chunks(upload.file, settings=settings),
+                        package_path=True,
+                    )
+                    actual_size = int(file_info["size"])
+                    actual_sha256 = str(file_info["sha256"])
+                    total_bytes += actual_size
+                    enforce_upload_bytes(settings, total_bytes=total_bytes)
+                    if artifact.size is not None and actual_size != artifact.size:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Artifact size does not match manifest for {artifact.path}",
+                        )
+                    if artifact.sha256 is not None and actual_sha256 != artifact.sha256:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Artifact sha256 does not match manifest for {artifact.path}",
+                        )
+                    try:
+                        sniffed_media_type = validate_media_type(
+                            artifact.media_type,
+                            sniff_media_type(bytes(file_info["sample"]), artifact.media_type),
+                        )
+                    except MediaTypeError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
+                    file_records.append(
+                        {
+                            "path": artifact.path,
+                            "original_filename": upload.filename,
+                            "size": actual_size,
+                            "sha256": actual_sha256,
+                            "media_type": artifact.media_type,
+                            "sniffed_media_type": sniffed_media_type,
+                        }
+                    )
+                summary = v2_version_summary(parsed_manifest)
+            else:
+                assert isinstance(parsed_manifest, ManifestModel)
+                logical_path = expected_paths[0]
+                upload = uploads_by_path[logical_path]
+                file_info = storage.write_staged_file(
+                    staged,
+                    logical_path,
+                    iter_limited_file_chunks(upload.file, settings=settings),
                 )
-            except MediaTypeError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            file_records = [
-                {
-                    "path": logical_path,
-                    "original_filename": upload.filename,
-                    "size": total_bytes,
-                    "sha256": str(file_info["sha256"]),
-                    "media_type": parsed_manifest.media_type,
-                    "sniffed_media_type": sniffed_media_type,
-                }
-            ]
+                total_bytes = int(file_info["size"])
+                enforce_upload_bytes(settings, total_bytes=total_bytes)
+                try:
+                    sniffed_media_type = validate_media_type(
+                        parsed_manifest.media_type,
+                        sniff_media_type(bytes(file_info["sample"]), parsed_manifest.media_type),
+                    )
+                except MediaTypeError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                file_records.append(
+                    {
+                        "path": logical_path,
+                        "original_filename": upload.filename,
+                        "size": total_bytes,
+                        "sha256": str(file_info["sha256"]),
+                        "media_type": parsed_manifest.media_type,
+                        "sniffed_media_type": sniffed_media_type,
+                    }
+                )
+                summary = v1_version_summary(parsed_manifest)
 
             manifest_sha = sha256_bytes(manifest_bytes)
             file_set_sha = file_set_sha256(file_records)
@@ -574,12 +708,12 @@ def create_app() -> FastAPI:
                     manifest_sha256=manifest_sha,
                     file_set_sha256=file_set_sha,
                     manifest_size=len(manifest_bytes),
-                    format=parsed_manifest.format,
-                    media_type=parsed_manifest.media_type,
-                    data_kind=parsed_manifest.data_kind,
-                    product=parsed_manifest.product,
-                    title=parsed_manifest.title,
-                    bounds_json=json.dumps(parsed_manifest.bounds) if parsed_manifest.bounds is not None else None,
+                    format=summary["format"],
+                    media_type=summary["media_type"],
+                    data_kind=summary["data_kind"],
+                    product=summary["product"],
+                    title=summary["title"],
+                    bounds_json=summary["bounds_json"],
                     total_bytes=total_bytes,
                     file_count=len(file_records),
                     request_id=request_id,
