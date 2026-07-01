@@ -20,6 +20,7 @@ class Settings:
     db_path: Path
     tokens: tuple[TokenConfig, ...]
     principal_aliases: dict[str, str] = field(default_factory=dict)
+    cors_origins: tuple[str, ...] = ()
     bind_host: str = "127.0.0.1"
     max_manifest_bytes: int = 1 * 1024 * 1024
     max_files_per_upload: int = 64
@@ -63,6 +64,16 @@ def _load_aliases(value: str | None) -> dict[str, str]:
     return {str(key): str(alias) for key, alias in raw.items()}
 
 
+def _load_cors_origins(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+
+    raw = json.loads(value)
+    if not isinstance(raw, list):
+        raise ValueError("DTCC_UPLOAD_CORS_ORIGINS_JSON must be a JSON list")
+    return tuple(str(origin) for origin in raw)
+
+
 def load_settings() -> Settings:
     tokens_json = os.environ.get("DTCC_UPLOAD_TOKENS_JSON", "[]")
     return Settings(
@@ -70,5 +81,6 @@ def load_settings() -> Settings:
         db_path=Path(os.environ.get("DTCC_UPLOAD_DB_PATH", "storage/catalog.sqlite3")),
         tokens=_load_tokens(tokens_json),
         principal_aliases=_load_aliases(os.environ.get("DTCC_UPLOAD_PRINCIPAL_ALIASES_JSON")),
+        cors_origins=_load_cors_origins(os.environ.get("DTCC_UPLOAD_CORS_ORIGINS_JSON")),
         bind_host=os.environ.get("DTCC_UPLOAD_BIND_HOST", "127.0.0.1"),
     )

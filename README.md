@@ -59,6 +59,12 @@ If a token uses an alternate principal name, set `DTCC_UPLOAD_PRINCIPAL_ALIASES_
 {"vbassn": "vasnas"}
 ```
 
+To allow a browser app on another origin to browse the catalog, set `DTCC_UPLOAD_CORS_ORIGINS_JSON`:
+
+```json
+["http://localhost:5175"]
+```
+
 Uploads run in Starlette's worker threadpool because the route is a sync `def`.
 For non-trivial deployments, use multiple Uvicorn workers and tune the AnyIO
 thread limiter if large concurrent uploads saturate the default pool.

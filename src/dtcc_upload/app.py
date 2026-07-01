@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 from typing import BinaryIO
 
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -193,6 +194,16 @@ def create_app() -> FastAPI:
         finally:
             if acquired_principal_id is not None:
                 app.state.upload_limiter.release(acquired_principal_id)
+
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_origins),
+            allow_methods=["GET", "HEAD", "OPTIONS"],
+            allow_headers=["Authorization", "If-None-Match", "Range"],
+            expose_headers=["ETag", "Content-Disposition", "Accept-Ranges", "Content-Range"],
+            allow_credentials=False,
+        )
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

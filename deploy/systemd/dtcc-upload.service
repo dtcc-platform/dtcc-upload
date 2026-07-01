@@ -1,0 +1,41 @@
+[Unit]
+Description=DTCC Upload API
+Documentation=https://github.com/dtcc-platform/dtcc-upload
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=dtcc-upload
+Group=dtcc-upload
+WorkingDirectory=/srv/dtcc-upload
+EnvironmentFile=/etc/dtcc-upload/dtcc-upload.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/test -x /srv/dtcc-upload/.venv/bin/uvicorn
+ExecStart=/srv/dtcc-upload/.venv/bin/uvicorn dtcc_upload.app:create_app --factory --host 127.0.0.1 --port 8000 --workers 2
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+LimitNOFILE=65535
+UMask=0027
+
+StateDirectory=dtcc-upload
+StateDirectoryMode=0750
+RuntimeDirectory=dtcc-upload
+RuntimeDirectoryMode=0750
+ReadWritePaths=/var/lib/dtcc-upload
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

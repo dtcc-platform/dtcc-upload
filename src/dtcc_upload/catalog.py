@@ -928,7 +928,8 @@ class Catalog:
                     f"""
                     SELECT d.dataset_key, d.owner_principal_id, d.latest_committed_version_id,
                            v.version_id, v.version_number, v.status, v.format,
-                           v.media_type, v.data_kind, v.product, v.committed_at
+                           v.media_type, v.data_kind, v.product, v.title,
+                           v.bounds_json, v.total_bytes, v.file_count, v.committed_at
                     FROM datasets d
                     JOIN versions v ON v.dataset_key = d.dataset_key
                     WHERE {" AND ".join(predicates)}
