@@ -205,6 +205,19 @@ def create_app() -> FastAPI:
             allow_credentials=False,
         )
 
+    @app.get("/")
+    def index() -> dict[str, object]:
+        return {
+            "service": "dtcc-upload",
+            "status": "ok",
+            "links": {
+                "docs": "/docs",
+                "health": "/healthz",
+                "ready": "/readyz",
+                "datasets": "/v1/datasets",
+            },
+        }
+
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
