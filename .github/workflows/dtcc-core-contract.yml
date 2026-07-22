@@ -1,0 +1,67 @@
+name: dtcc-core contract
+
+run-name: dtcc-core contract at ${{ github.event.client_payload.core_sha || inputs.core_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: Full dtcc-core commit SHA to test
+        required: true
+        type: string
+      core_run_id:
+        description: GitHub Actions run ID containing the contract artifact
+        required: true
+        type: string
+  repository_dispatch:
+    types: [dtcc-core-contract]
+
+concurrency:
+  group: dtcc-core-contract-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    env:
+      CORE_SHA: ${{ github.event.client_payload.core_sha || inputs.core_sha }}
+      CORE_RUN_ID: ${{ github.event.client_payload.core_run_id || inputs.core_run_id }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Validate dtcc-core artifact reference
+        run: |
+          if [[ ! "${CORE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "core_sha must be a full lowercase 40-character commit SHA"
+            exit 1
+          fi
+          if [[ ! "${CORE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "core_run_id must be a positive integer"
+            exit 1
+          fi
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download dtcc-core contract artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: dtcc-core-contract-${{ env.CORE_SHA }}
+          path: dtcc-core-artifact
+          github-token: ${{ secrets.DTCC_CORE_ARTIFACT_TOKEN }}
+          repository: dtcc-platform/dtcc-core
+          run-id: ${{ env.CORE_RUN_ID }}
+
+      - name: Verify contract artifact layout
+        run: test -f dtcc-core-artifact/contract-artifacts/golden.dtccpkg
+
+      - name: Run dtcc-core contract test
+        env:
+          DTCC_CORE_CONTRACT_DIR: ${{ github.workspace }}/dtcc-core-artifact/contract-artifacts
+        run: uv run --frozen --extra test pytest -q tests/test_dtcc_core_contract.py
