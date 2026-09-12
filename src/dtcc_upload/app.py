@@ -92,7 +92,7 @@ def match_v2_uploads(artifacts: list[ManifestV2Artifact], files: list[UploadFile
 
 
 def v2_version_summary(manifest: ManifestV2Model) -> dict[str, object]:
-    primary = next((artifact for artifact in manifest.artifacts if artifact.role == "primary"), manifest.artifacts[0])
+    primary = next((artifact for artifact in manifest.artifacts if artifact.role in {"primary", "canonical_model"}), manifest.artifacts[0])
     product_value = manifest.request.parameters.get("product") if manifest.request.parameters else None
     bounds = primary.bounds if primary.bounds is not None else manifest.request.bounds
     return {

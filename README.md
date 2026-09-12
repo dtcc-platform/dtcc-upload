@@ -1,5 +1,14 @@
 # DTCC Upload
 
+Dataset Manifest v3 (`dtcc-dataset-manifest-v3`) uses the same multipart and
+retrieval endpoints. It requires exactly one `canonical_model` artifact, explicit
+model type/wire version, and size/SHA-256 declarations for every artifact.
+Derivatives reference the canonical artifact. The service preserves the original
+manifest/context and model bytes and verifies upload integrity; semantic model
+validation remains the producer/consumer's responsibility in Core. No Core or
+LinkML runtime dependency is required here.
+
+
 Small FastAPI backend for accepting precomputed DTCC dataset manifests and attached files.
 
 This v1 storage implementation targets POSIX filesystems. Crash-durability paths use `fsync` on files and parent directories.

@@ -6,7 +6,10 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from dtcc_upload.models import MANIFEST_V2_SCHEMA_VERSION, ManifestModel, ManifestV2Model
+from dtcc_upload.models import (
+    MANIFEST_V2_SCHEMA_VERSION, MANIFEST_V3_SCHEMA_VERSION,
+    ManifestModel, ManifestV2Model, ManifestV3Model,
+)
 from dtcc_upload.paths import validate_logical_path as _validate_logical_path
 from dtcc_upload.paths import validate_package_path as _validate_package_path
 
@@ -48,17 +51,19 @@ def validate_manifest(raw: dict[str, Any]) -> ManifestModel | ManifestV2Model:
         raise ManifestValidationError("Manifest must be a JSON object")
     _reject_non_finite(raw)
     schema_version = raw.get("schema_version")
-    if schema_version is not None and schema_version != MANIFEST_V2_SCHEMA_VERSION:
+    if schema_version is not None and schema_version not in {MANIFEST_V2_SCHEMA_VERSION, MANIFEST_V3_SCHEMA_VERSION}:
         raise ManifestValidationError(
             f"Unsupported manifest schema_version: {schema_version!r}; "
-            f"expected {MANIFEST_V2_SCHEMA_VERSION!r}"
+            "expected Dataset Manifest v2 or v3"
         )
     if schema_version is None and ("artifacts" in raw or "identity" in raw):
         raise ManifestValidationError(
             f"Dataset Manifest v2 packages must declare schema_version={MANIFEST_V2_SCHEMA_VERSION!r}"
         )
     try:
-        if schema_version == MANIFEST_V2_SCHEMA_VERSION:
+        if schema_version == MANIFEST_V3_SCHEMA_VERSION:
+            manifest = ManifestV3Model.model_validate(raw)
+        elif schema_version == MANIFEST_V2_SCHEMA_VERSION:
             manifest = ManifestV2Model.model_validate(raw)
         else:
             manifest = ManifestModel.model_validate(raw)

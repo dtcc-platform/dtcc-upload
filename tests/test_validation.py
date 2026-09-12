@@ -371,7 +371,7 @@ def test_validate_manifest_rejects_v2_shape_without_schema_version_even_if_v1_fi
 
 def test_validate_manifest_rejects_wrong_schema_version_even_if_v1_fields_exist():
     manifest = _v2_manifest(_v2_artifact("artifacts/smoke_slice.png"))
-    manifest["schema_version"] = "dtcc-dataset-manifest-v3"
+    manifest["schema_version"] = "dtcc-dataset-manifest-v999"
     manifest.update(
         {
             "name": "smoke",

@@ -11,6 +11,7 @@ from dtcc_upload.paths import validate_package_path
 
 
 MANIFEST_V2_SCHEMA_VERSION = "dtcc-dataset-manifest-v2"
+MANIFEST_V3_SCHEMA_VERSION = "dtcc-dataset-manifest-v3"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -157,4 +158,40 @@ class ManifestV2Model(BaseModel):
             if artifact.path in seen:
                 raise ValueError(f"duplicate artifact path: {artifact.path}")
             seen.add(artifact.path)
+        return self
+
+
+class ManifestV3Model(ManifestV2Model):
+    """Canonical package envelope; model bytes are opaque to the upload service.
+
+    Preserve all context and artifact extensions. Core validates native model
+    meaning; this service validates the envelope and uploaded byte integrity.
+    """
+
+    schema_version: Literal["dtcc-dataset-manifest-v3"]
+
+    @model_validator(mode="after")
+    def validate_canonical_artifacts(self) -> ManifestV3Model:
+        canonical = [item for item in self.artifacts if item.role == "canonical_model"]
+        if len(canonical) != 1:
+            raise ValueError("Canonical package requires exactly one canonical_model artifact")
+        model = canonical[0]
+        if (model.format != "dtcc" or model.media_type != "application/vnd.dtcc.model+protobuf"
+                or model.data_kind != "model" or getattr(model, "derived_from", None) is not None):
+            raise ValueError("Invalid canonical model artifact declaration")
+        model_type = getattr(model, "model_type", None)
+        wire_version = getattr(model, "model_schema_version", None)
+        if not isinstance(model_type, str) or not model_type.strip():
+            raise ValueError("Canonical artifact requires model_type")
+        if type(wire_version) is not int or wire_version <= 0:
+            raise ValueError("Canonical artifact requires a positive model_schema_version")
+        for artifact in self.artifacts:
+            if artifact.path == "manifest.json":
+                raise ValueError("Artifact path must not overwrite manifest.json")
+            if artifact.size is None or artifact.sha256 is None:
+                raise ValueError("Canonical package artifacts require size and sha256")
+            if artifact is not model and (
+                artifact.role != "derived" or getattr(artifact, "derived_from", None) != model.path
+            ):
+                raise ValueError("Derived artifacts must reference the canonical model")
         return self
